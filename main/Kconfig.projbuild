@@ -1,0 +1,40 @@
+menu "NUT UPS Server Configuration"
+
+    config NUT_TCP_BIND_ADDRESS
+        string "TCP server bind address"
+        default "0.0.0.0"
+        help
+            Address the NUT server listens on (IPv4 or IPv6).
+
+    config NUT_TCP_BIND_PORT
+        string "TCP server bind port"
+        default "3493"
+        help
+            Port for the NUT protocol (standard is 3493).
+
+    config NUT_UPS_NAME
+        string "UPS name for NUT protocol"
+        default "ups"
+        help
+            The logical name clients use to refer to this UPS (e.g. LIST VAR <name>).
+
+    config NUT_POLL_INTERVAL_MS
+        int "UPS poll interval (ms)"
+        default 1000
+        range 200 10000
+        help
+            How often to read HID reports from the UPS (milliseconds).
+
+    config NUT_LED_GPIO
+        int "RGB LED GPIO number"
+        default 48
+        help
+            GPIO for the on-board addressable RGB LED.
+
+    config NUT_BUTTON_GPIO
+        int "Button GPIO for beeper toggle"
+        default 0
+        help
+            GPIO for the button that toggles the UPS beeper (typically BOOT button).
+
+endmenu
