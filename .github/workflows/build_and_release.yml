@@ -1,0 +1,47 @@
+name: Build and Release
+
+on:
+  push:
+    branches: [main]
+  release:
+    types: [published]
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+
+    - name: Checkout repo
+      uses: actions/checkout@v4
+      with:
+        submodules: 'recursive'
+    - name: esp-idf build
+      uses: espressif/esp-idf-ci-action@v1
+      with:
+        esp_idf_version: v5.4
+        target: esp32s3
+        path: '/'
+
+    - name: Package zip
+      run: |
+        TAG="${GITHUB_REF##*/}"
+        mkdir -p release_staging
+        cp build/*.bin build/*.elf release_staging/
+        cp build/bootloader/bootloader.bin release_staging/
+        cp build/partition_table/partition-table.bin release_staging/
+        cp build/flasher_args.json build/flash_args release_staging/
+        cp flash_esp32.sh release_staging/ 2>/dev/null || true
+        cd release_staging
+        zip -r "../esp-usb-nut-server-${TAG}.zip" .
+
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: esp-usb-nut-server
+        path: esp-usb-nut-server-*.zip
+
+    - name: Attach release zip
+      uses: softprops/action-gh-release@v2
+      if: ${{ github.event.release && github.event.action == 'published' }}
+      with:
+        files: esp-usb-nut-server-*.zip

@@ -22,9 +22,22 @@ I haven't tested this firmware extensively across a variety of UPS units, so don
 
 The on-board addressable RGB LED (GPIO 48 on most ESP32-S3 DevKitC boards) is used for status indication. The BOOT button (GPIO 0) is used for WiFi reset and beeper toggle.
 
-## Building
+## To Flash a Release Build
 
-Requires [ESP-IDF v5.0+](https://docs.espressif.com/projects/esp-idf/en/stable/esp32s3/get-started/).
+Requires [ESP-IDF](https://docs.espressif.com/projects/esp-idf/en/stable/esp32s3/get-started/).
+
+```bash
+# Source the ESP-IDF environment
+. /path/to/esp-idf/export.sh
+
+# Flash
+cd /path/to/extracted/release
+./flash_esp32.sh
+```
+
+## Building From Sources
+
+Requires [ESP-IDF v5.4](https://docs.espressif.com/projects/esp-idf/en/stable/esp32s3/get-started/).
 
 ```bash
 # Source the ESP-IDF environment
