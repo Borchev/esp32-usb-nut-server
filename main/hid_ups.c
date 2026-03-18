@@ -1477,9 +1477,9 @@ static void poll_task(void *arg)
             poll_reports(u);
             xSemaphoreGive(s_mutex);
 
-            if (!u->flag_val[FLAG_AC_PRESENT] ||
-                !u->flag_val[FLAG_GOOD] ||
-                u->flag_val[FLAG_INTERNAL_FAILURE])
+            if ((u->flag_present[FLAG_AC_PRESENT] && !u->flag_val[FLAG_AC_PRESENT]) ||
+                (u->flag_present[FLAG_GOOD] && !u->flag_val[FLAG_GOOD]) ||
+                (u->flag_present[FLAG_INTERNAL_FAILURE] && u->flag_val[FLAG_INTERNAL_FAILURE]))
                 any_alert = true;
         }
 
