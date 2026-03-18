@@ -1462,10 +1462,34 @@ static void poll_task(void *arg)
     };
     gpio_config(&btn);
 
-    while (true) {
-        vTaskDelay(pdMS_TO_TICKS(CONFIG_NUT_POLL_INTERVAL_MS));
+    bool btn_prev = true;  /* Button is active-low with pull-up */
+    bool any_connected = false;
 
-        bool any_connected = false;
+    /* Button is sampled every 50 ms for responsive press detection.
+     * UPS polling happens at the configured interval (default 1 s). */
+    const int btn_tick_ms = 50;
+    int poll_accum = 0;
+
+    while (true) {
+        vTaskDelay(pdMS_TO_TICKS(btn_tick_ms));
+        poll_accum += btn_tick_ms;
+
+        /* --- Button check (every 50 ms) --- */
+        bool btn_now = gpio_get_level(CONFIG_NUT_BUTTON_GPIO);
+        if (any_connected && !btn_now && btn_prev) {
+            for (int i = 0; i < MAX_UPS_DEVICES; i++) {
+                if (s_ups[i].connected)
+                    toggle_beeper_i(&s_ups[i]);
+            }
+        }
+        btn_prev = btn_now;
+
+        /* --- UPS poll + LED update (every CONFIG_NUT_POLL_INTERVAL_MS) --- */
+        if (poll_accum < CONFIG_NUT_POLL_INTERVAL_MS)
+            continue;
+        poll_accum = 0;
+
+        any_connected = false;
         bool any_alert = false;
 
         for (int i = 0; i < MAX_UPS_DEVICES; i++) {
@@ -1481,14 +1505,6 @@ static void poll_task(void *arg)
                 (u->flag_present[FLAG_GOOD] && !u->flag_val[FLAG_GOOD]) ||
                 (u->flag_present[FLAG_INTERNAL_FAILURE] && u->flag_val[FLAG_INTERNAL_FAILURE]))
                 any_alert = true;
-        }
-
-        /* Toggle beeper on ALL connected UPS when button pressed */
-        if (any_connected && !gpio_get_level(CONFIG_NUT_BUTTON_GPIO)) {
-            for (int i = 0; i < MAX_UPS_DEVICES; i++) {
-                if (s_ups[i].connected)
-                    toggle_beeper_i(&s_ups[i]);
-            }
         }
 
         /* LED: worst-case across all UPS */

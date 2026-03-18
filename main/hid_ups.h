@@ -4,7 +4,7 @@
 #include <stdint.h>
 #include <stddef.h>
 
-#define MAX_UPS_DEVICES   4
+#define MAX_UPS_DEVICES   10
 #define MAX_NUT_VARS     64
 #define NUT_VAR_NAME_LEN 48
 #define NUT_VAR_VALUE_LEN 64

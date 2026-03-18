@@ -7,7 +7,7 @@ I haven't tested this firmware extensively across a variety of UPS units, so don
 ## Features
 
 - **Generic HID parsing** - auto-discovers UPS capabilities from the HID report descriptor; no hardcoded UPS models
-- **Multi-UPS support** - multiple (up to 4 by default) UPS devices simultaneously via a USB hub, each exposed as a separate NUT device
+- **Multi-UPS support** - multiple (up to 10 by default) UPS devices simultaneously via a USB hub, each exposed as a separate NUT device
 - **NUT protocol server** - standard TCP port 3493, compatible with any NUT client
 - **WiFi captive portal** - on first boot, the ESP32 creates an AP ("ESP32 NUT Server Setup") with a web page to select and join a WiFi network; credentials are stored in flash
 - **Runtime WiFi reset** - hold the BOOT button for 3 seconds at any time to erase stored credentials and re-enter the setup portal
