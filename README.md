@@ -1,9 +1,11 @@
 [![PR Build](https://github.com/Borchev/esp32-usb-nut-server/actions/workflows/pr_build.yml/badge.svg)](https://github.com/Borchev/esp32-usb-nut-server/actions/workflows/pr_build.yml)
 # ESP32 USB HID UPS NUT Server
 
-An ESP32 firmware that bridges USB HID-compliant UPS devices to WiFi via the [NUT (Network UPS Tools)](https://networkupstools.org/) protocol. Plug in any standard USB HID UPS and monitor it from any NUT-compatible client - Home Assistant, upsc, NUT Monitor, etc.
+An ESP32 NUT server implementation that supports version 1.3 (latest at the time of writing) of the [NUT (Network UPS Tools)](https://networkupstools.org/) protocol. Plug in a USB HID UPS and monitor it from any NUT-compatible client over wifi - Home Assistant, upsc, NUT Monitor, etc.
 
-I haven't tested this firmware extensively across a variety of UPS units, so don't be surprised if things are broken and/or buggy.
+Supports most USB-HID based UPS models across many brands including APC, Belkin, CyberPower, EcoFlow, Legrand, Liebert / Emerson, PowerCOM, Tripp Lite, and many others.
+
+I haven't tested this firmware extensively across every UPS model, so don't be surprised if things are broken and/or buggy.
 
 ## Features
 
