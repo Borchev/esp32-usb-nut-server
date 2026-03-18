@@ -1,3 +1,4 @@
+[![PR Build](https://github.com/Borchev/esp32-usb-nut-server/actions/workflows/pr_build.yml/badge.svg)](https://github.com/Borchev/esp32-usb-nut-server/actions/workflows/pr_build.yml)
 # ESP32 USB HID UPS NUT Server
 
 An ESP32 firmware that bridges USB HID-compliant UPS devices to WiFi via the [NUT (Network UPS Tools)](https://networkupstools.org/) protocol. Plug in any standard USB HID UPS and monitor it from any NUT-compatible client - Home Assistant, upsc, NUT Monitor, etc.
