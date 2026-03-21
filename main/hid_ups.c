@@ -692,13 +692,20 @@ static void parse_descriptor(ups_instance_t *u, const uint8_t *desc, size_t len)
                         fu = (i < (uint32_t)ucount) ? usages[i] : usages[ucount - 1];
                     }
 
-                    if (!is_const && fu != 0) {
+                    if (fu != 0) {
                         uint16_t up = (fu >> 16) & 0xFFFF;
                         uint16_t uid = fu & 0xFFFF;
                         usage_ctx_t ctx = ctx_from_stack(cstack, cdepth);
                         const usage_map_t *m = find_mapping(up, uid, ctx);
 
-                        if (m && (m->flag_id < FLAG_MAX ||
+                        /* Old APC models mark dynamic fields (e.g.
+                         * RemainingCapacity, RunTimeToEmpty, ACPresent)
+                         * as HID-constant yet still return valid data
+                         * via GET_REPORT.  Skip only unmapped constant
+                         * fields (true padding/static data). */
+                        if (is_const && !m) {
+                            /* no-op: unmapped constant field */
+                        } else if (m && (m->flag_id < FLAG_MAX ||
                                   (m->nut_name && !name_mapped_i(u, m->nut_name)))) {
                             mapped_field_t *f = &u->fields[u->nfields];
                             if (m->nut_name)
