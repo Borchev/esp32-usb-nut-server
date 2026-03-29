@@ -34,6 +34,7 @@
  */
 
 #include "hid_ups.h"
+#include "apc_modbus.h"
 #include "led_status.h"
 
 #include <string.h>
@@ -64,6 +65,59 @@ static const char *TAG = "hid-ups";
 #define MAX_USAGES_PER_ITEM  32
 #define MAX_REPORT_BUF       64
 #define MAX_POLL_REPORTS      32
+
+/* ================================================================== */
+/* HID host internal struct access (for USB device handle extraction)  */
+/* Must match espressif/usb_host_hid internal layout.                  */
+/* Needed because the component doesn't expose the raw USB handle or   */
+/* interrupt OUT endpoint - we need both for APC Modbus.               */
+/* ================================================================== */
+
+typedef struct {
+    struct { void *stqe_next; } tailq_entry;
+    SemaphoreHandle_t  device_busy;
+    SemaphoreHandle_t  ctrl_xfer_done;
+    usb_transfer_t    *ctrl_xfer;
+    usb_device_handle_t dev_hdl;
+} hid_device_internal_t;
+
+typedef struct {
+    struct { void *stqe_next; } tailq_entry;
+    hid_device_internal_t *parent;
+} hid_iface_internal_t;
+
+static usb_device_handle_t get_usb_dev_handle(hid_host_device_handle_t hid_dev)
+{
+    return ((hid_iface_internal_t *)hid_dev)->parent->dev_hdl;
+}
+
+/* Find the first interrupt OUT endpoint on a USB device's HID interface. */
+static bool find_interrupt_out_ep(usb_device_handle_t dev,
+                                  uint8_t *addr, uint16_t *mps)
+{
+    const usb_config_desc_t *cfg;
+    if (usb_host_get_active_config_descriptor(dev, &cfg) != ESP_OK)
+        return false;
+
+    int offset = 0;
+    /* Interface 0 is typically the HID interface on APC UPS */
+    const usb_intf_desc_t *iface = usb_parse_interface_descriptor(
+        cfg, 0, 0, &offset);
+    if (!iface) return false;
+
+    for (int i = 0; i < iface->bNumEndpoints; i++) {
+        int ep_offset = 0;
+        const usb_ep_desc_t *ep = usb_parse_endpoint_descriptor_by_index(
+            iface, i, cfg->wTotalLength, &ep_offset);
+        if (ep && !USB_EP_DESC_GET_EP_DIR(ep) &&
+            (ep->bmAttributes & 0x03) == USB_BM_ATTRIBUTES_XFER_INT) {
+            *addr = ep->bEndpointAddress;
+            *mps = USB_EP_DESC_GET_MPS(ep);
+            return true;
+        }
+    }
+    return false;
+}
 
 /* ================================================================== */
 /* HID usage context (from collection hierarchy)                       */
@@ -167,6 +221,9 @@ typedef struct {
     int  beeper_idx;
     int  test_idx;
     char name[32];
+
+    uint8_t modbus_rx_rid;   /* Modbus RX report ID (host→device, 0 if none) */
+    uint8_t modbus_tx_rid;   /* Modbus TX report ID (device→host, 0 if none) */
 } ups_instance_t;
 
 /* ================================================================== */
@@ -693,6 +750,13 @@ static void parse_descriptor(ups_instance_t *u, const uint8_t *desc, size_t len)
                     }
 
                     if (fu != 0) {
+                        /* Check for APC Modbus TX usage in Input items */
+                        if (fu == 0xFF8600FD) {
+                            u->modbus_tx_rid = g_rid;
+                            ESP_LOGI(TAG, "'%s': Modbus TX usage (RID=0x%02X)",
+                                     u->name, g_rid);
+                        }
+
                         uint16_t up = (fu >> 16) & 0xFFFF;
                         uint16_t uid = fu & 0xFFFF;
                         usage_ctx_t ctx = ctx_from_stack(cstack, cdepth);
@@ -746,9 +810,26 @@ static void parse_descriptor(ups_instance_t *u, const uint8_t *desc, size_t len)
                 break;
             }
 
-            case 0x9: /* Output - skip */
+            case 0x9: /* Output - check for APC Modbus RX usage */
+            {
+                for (uint32_t i = 0; i < g_rcount; i++) {
+                    uint32_t fu = 0;
+                    if (urange) {
+                        fu = umin + i;
+                        if (fu > umax) fu = umax;
+                    } else if (ucount > 0) {
+                        fu = (i < (uint32_t)ucount) ? usages[i]
+                                                     : usages[ucount - 1];
+                    }
+                    if (fu == 0xFF8600FC) {  /* Modbus RX (host→device) */
+                        u->modbus_rx_rid = g_rid;
+                        ESP_LOGI(TAG, "'%s': Modbus RX usage (RID=0x%02X)",
+                                 u->name, g_rid);
+                    }
+                }
                 ucount = 0; urange = false;
                 break;
+            }
             }
             break;
         }
@@ -1291,9 +1372,19 @@ static void iface_cb(hid_host_device_handle_t dev,
 
     switch (ev) {
     case HID_HOST_INTERFACE_EVENT_INPUT_REPORT:
+        if (u->modbus_tx_rid) {
+            uint8_t data[64];
+            size_t data_len = 0;
+            if (hid_host_device_get_raw_input_report_data(
+                    dev, data, sizeof(data), &data_len) == ESP_OK
+                && data_len > 0 && data[0] == u->modbus_tx_rid) {
+                apc_modbus_on_input_report(u->name, data, data_len);
+            }
+        }
         break;
     case HID_HOST_INTERFACE_EVENT_DISCONNECTED:
         ESP_LOGI(TAG, "UPS '%s' disconnected", u->name);
+        apc_modbus_close(u->name);
         u->connected = false;
         hid_host_device_close(dev);
         u->slot_used = false;
@@ -1397,19 +1488,24 @@ static void on_device_event(hid_host_device_handle_t dev,
         ESP_LOGW(TAG, "'%s': could not retrieve HID report descriptor", u->name);
     }
 
-    /* Some devices require poll-only mode (no interrupt pipe):
-     * - APC 5G models (PID 0x0003, 0x0004): interrupt pipe used for
-     *   proprietary protocol, not standard HID events
-     * - Legrand: interrupt pipe causes communication failures
-     * Polling via control transfers (GET_REPORT) still works.
-     * Disconnect is detected when poll_reports() gets all errors. */
-    bool skip_interrupt = false;
-    if (u->vid == VID_APC &&
+    /* ---- Determine if Modbus should be attempted ---- */
+    bool try_modbus = (u->modbus_rx_rid || u->modbus_tx_rid);
+
+    /* APC 5G without explicit Modbus usages: set default RIDs */
+    if (!try_modbus && u->vid == VID_APC &&
         (u->pid == PID_APC_5G_A || u->pid == PID_APC_5G_B))
     {
-        ESP_LOGW(TAG, "'%s': APC 5G model - using poll-only mode", u->name);
-        skip_interrupt = true;
+        u->modbus_rx_rid = 0x90;  /* Default host→device */
+        u->modbus_tx_rid = 0x89;  /* Default device→host */
+        try_modbus = true;
     }
+
+    /* ---- Start interrupt pipe ----
+     * Modbus needs the interrupt IN pipe for receiving responses.
+     * Skip only for non-Modbus devices with known interrupt issues.
+     * APC 5G without Modbus would use poll-only, but since we always
+     * try Modbus for 5G models, that case doesn't arise. */
+    bool skip_interrupt = false;
     if (u->vid == VID_LEGRAND) {
         ESP_LOGW(TAG, "'%s': Legrand UPS - using poll-only mode", u->name);
         skip_interrupt = true;
@@ -1417,9 +1513,33 @@ static void on_device_event(hid_host_device_handle_t dev,
     if (!skip_interrupt) {
         ESP_ERROR_CHECK(hid_host_device_start(dev));
     }
+
+    /* ---- Try APC Modbus transport ----
+     * Must happen after hid_host_device_start so the interrupt IN pipe
+     * is active for receiving Modbus responses.
+     * Sends go via interrupt OUT (extracted from USB config descriptor). */
+    bool modbus_ok = false;
+    if (try_modbus) {
+        usb_device_handle_t usb_dev = get_usb_dev_handle(dev);
+        uint8_t ep_out_addr = 0;
+        uint16_t ep_out_mps = 0;
+        find_interrupt_out_ep(usb_dev, &ep_out_addr, &ep_out_mps);
+
+        ESP_LOGI(TAG, "'%s': probing APC Modbus (RX=0x%02X, TX=0x%02X, "
+                 "EP_OUT=0x%02X/%d)",
+                 u->name, u->modbus_rx_rid, u->modbus_tx_rid,
+                 ep_out_addr, ep_out_mps);
+        modbus_ok = apc_modbus_init(usb_dev, ep_out_addr, ep_out_mps,
+                                    u->modbus_rx_rid, u->modbus_tx_rid,
+                                    u->name);
+        if (modbus_ok)
+            apc_modbus_read_inventory(u->name);
+    }
+
     u->connected = true;
 
-    ESP_LOGI(TAG, "UPS '%s' ready (%d mapped fields)", u->name, u->nfields);
+    ESP_LOGI(TAG, "UPS '%s' ready (%d mapped fields%s)",
+             u->name, u->nfields, modbus_ok ? ", Modbus active" : "");
 }
 
 static void device_cb(hid_host_device_handle_t dev,
@@ -1504,14 +1624,25 @@ static void poll_task(void *arg)
             if (!u->connected) continue;
             any_connected = true;
 
-            xSemaphoreTake(s_mutex, portMAX_DELAY);
-            poll_reports(u);
-            xSemaphoreGive(s_mutex);
+            if (apc_modbus_available(u->name)) {
+                apc_modbus_poll(u->name);
+                /* Derive alert from ups.status string */
+                char st[NUT_VAR_VALUE_LEN];
+                if (hid_ups_get_var(u->name, "ups.status", st, sizeof(st))) {
+                    if (strstr(st, "OB") || strstr(st, "LB") ||
+                        strstr(st, "OVER") || strstr(st, "OFF"))
+                        any_alert = true;
+                }
+            } else {
+                xSemaphoreTake(s_mutex, portMAX_DELAY);
+                poll_reports(u);
+                xSemaphoreGive(s_mutex);
 
-            if ((u->flag_present[FLAG_AC_PRESENT] && !u->flag_val[FLAG_AC_PRESENT]) ||
-                (u->flag_present[FLAG_GOOD] && !u->flag_val[FLAG_GOOD]) ||
-                (u->flag_present[FLAG_INTERNAL_FAILURE] && u->flag_val[FLAG_INTERNAL_FAILURE]))
-                any_alert = true;
+                if ((u->flag_present[FLAG_AC_PRESENT] && !u->flag_val[FLAG_AC_PRESENT]) ||
+                    (u->flag_present[FLAG_GOOD] && !u->flag_val[FLAG_GOOD]) ||
+                    (u->flag_present[FLAG_INTERNAL_FAILURE] && u->flag_val[FLAG_INTERNAL_FAILURE]))
+                    any_alert = true;
+            }
         }
 
         /* LED: worst-case across all UPS */
@@ -1716,6 +1847,16 @@ void hid_ups_toggle_beeper(const char *ups_name)
 {
     ups_instance_t *u = find_by_name(ups_name);
     if (u) toggle_beeper_i(u);
+}
+
+void hid_ups_set_var_ext(const char *ups_name, const char *name,
+                         const char *value)
+{
+    ups_instance_t *u = find_by_name(ups_name);
+    if (!u) return;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    set_var_i(u, name, value);
+    xSemaphoreGive(s_mutex);
 }
 
 /* ================================================================== */

@@ -50,3 +50,7 @@ bool hid_ups_instcmd(const char *ups_name, const char *cmdname);
 int  hid_ups_get_rw_vars(const char *ups_name, nut_var_t *out, int max);
 bool hid_ups_set_var(const char *ups_name, const char *varname, const char *value);
 bool hid_ups_is_rw_var(const char *ups_name, const char *varname);
+
+/* Thread-safe variable setter for use by external modules (e.g. Modbus). */
+void hid_ups_set_var_ext(const char *ups_name, const char *name,
+                         const char *value);
