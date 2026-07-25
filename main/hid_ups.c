@@ -205,6 +205,11 @@ typedef struct {
     hid_host_device_handle_t dev;
     bool connected;
     bool slot_used;
+    /* Set by the HID interface callback on disconnect. That callback runs on
+     * the HID driver task and must not close the device itself, because the
+     * poll task may be part way through a transfer on the same handle. The
+     * poll task performs the close while holding s_mutex. */
+    volatile bool close_pending;
 
     uint16_t vid;
     uint16_t pid;
@@ -1329,12 +1334,31 @@ static void poll_reports(ups_instance_t *u)
         ESP_LOGW(TAG, "'%s': all %d reports failed - marking disconnected",
                  u->name, nerrs);
         u->connected = false;
+        /* The device is closed here, so cancel any deferred close the
+         * interface callback flagged, otherwise the poll task would close it
+         * a second time. Clear the handle so nothing can reuse it. */
+        u->close_pending = false;
         hid_host_device_close(u->dev);
+        u->dev = NULL;
         u->slot_used = false;
         return;
     }
 
     derive_status(u);
+}
+
+/* Complete a disconnect that the HID interface callback deferred to us.
+ * Caller must hold s_mutex, which guarantees poll_reports() is not using
+ * the handle. */
+static void finish_pending_close(ups_instance_t *u)
+{
+    if (!u->close_pending) return;
+    u->close_pending = false;
+    if (u->dev) {
+        hid_host_device_close(u->dev);
+        u->dev = NULL;
+    }
+    u->slot_used = false;
 }
 
 /* ================================================================== */
@@ -1384,10 +1408,13 @@ static void iface_cb(hid_host_device_handle_t dev,
         break;
     case HID_HOST_INTERFACE_EVENT_DISCONNECTED:
         ESP_LOGI(TAG, "UPS '%s' disconnected", u->name);
-        apc_modbus_close(u->name);
-        u->connected = false;
-        hid_host_device_close(dev);
-        u->slot_used = false;
+        /* Do not close the device here. This callback runs on the HID driver
+         * task, which does not hold s_mutex, so closing frees the interface
+         * while the poll task may still be using the handle inside
+         * poll_reports(). That panics with LoadProhibited in
+         * hid_class_request_get(). Flag it and let the poll task close it. */
+        u->connected     = false;
+        u->close_pending = true;
         break;
     case HID_HOST_INTERFACE_EVENT_TRANSFER_ERROR:
         ESP_LOGW(TAG, "HID transfer error on '%s'", u->name);
@@ -1621,6 +1648,16 @@ static void poll_task(void *arg)
 
         for (int i = 0; i < MAX_UPS_DEVICES; i++) {
             ups_instance_t *u = &s_ups[i];
+
+            if (u->close_pending) {
+                /* Kept outside s_mutex to match the original call site: the
+                 * Modbus teardown path can call back into hid_ups_*. */
+                apc_modbus_close(u->name);
+                xSemaphoreTake(s_mutex, portMAX_DELAY);
+                finish_pending_close(u);
+                xSemaphoreGive(s_mutex);
+            }
+
             if (!u->connected) continue;
             any_connected = true;
 
