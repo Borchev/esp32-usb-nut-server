@@ -195,6 +195,8 @@ typedef struct {
 #define PID_APC_BACKUPS 0x0002   /* Most Back-UPS models (ES, CS, RS, XS) */
 #define PID_APC_5G_A    0x0003   /* 5G Smart-UPS models */
 #define PID_APC_5G_B    0x0004   /* Smart-UPS 1000 FW 04.3+ */
+#define VID_POWERWALKER 0x0665   /* PowerWalker VI 800 CSW IEC */
+#define PID_PW_VI_800   0x5161
 #define VID_ECOFLOW     0x3746
 #define VID_LEGRAND     0x1CB0
 #define VID_TRIPPLITE   0x09AE
@@ -1513,6 +1515,16 @@ static void on_device_event(hid_host_device_handle_t dev,
         apc_fix_voltage_range(u);
     } else {
         ESP_LOGW(TAG, "'%s': could not retrieve HID report descriptor", u->name);
+    }
+
+    /* This PowerWalker firmware resets unless both HID interfaces receive
+     * the same SET_IDLE initialization performed by Linux hid-generic. */
+    if (u->vid == VID_POWERWALKER && u->pid == PID_PW_VI_800) {
+        esp_err_t idle_err = hid_class_request_set_idle(dev, 0, 0);
+        if (idle_err != ESP_OK) {
+            ESP_LOGW(TAG, "'%s': SET_IDLE failed: %s",
+                     u->name, esp_err_to_name(idle_err));
+        }
     }
 
     /* ---- Determine if Modbus should be attempted ---- */
