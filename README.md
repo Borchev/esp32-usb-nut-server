@@ -78,6 +78,10 @@ Build-time options are available under `NUT UPS Server Configuration` in `idf.py
 4. Select your WiFi network, enter the password, and click Connect
 5. The ESP32 should connect to the selected network and disable the WiFi setup AP
 
+If the ESP32 can't reach its saved network when it starts up (for example, the router is still booting after a power cut), it opens the setup portal but keeps retrying the saved network every 30 seconds, and closes the portal once it reconnects.
+
+If the WiFi connection drops later (for example, the access point reboots), the ESP32 keeps trying to reconnect in the background, backing off to one attempt every 30 seconds, until the network is back.
+
 To re-enter setup mode at any time, **hold the BOOT button for 3 seconds**. The device erases stored credentials and reboots into the portal.
 
 ## USB Connections

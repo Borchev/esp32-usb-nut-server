@@ -5,6 +5,8 @@
  * the ESP32 creates an open access point that hosts a simple web
  * page where the user picks a network and enters the password.  Once
  * submitted the AP shuts down and the device connects as a station.
+ * While the portal is up, stored credentials keep being retried, so the
+ * device recovers by itself if their network was only briefly down.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -31,10 +33,12 @@
 #include "esp_http_server.h"
 #include "esp_event.h"
 #include "esp_netif.h"
+#include "esp_timer.h"
 #include "nvs_flash.h"
 #include "driver/gpio.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
+#include "freertos/semphr.h"
 #include "lwip/inet.h"
 
 static const char *TAG = "wifi-prov";
@@ -46,6 +50,9 @@ static const char *TAG = "wifi-prov";
 #define NVS_KEY_PASS  "pass"
 #define SCAN_MAX      20
 #define STA_CONNECT_TIMEOUT_MS 15000
+#define STA_CONNECT_RETRIES 3
+#define RECONNECT_MIN_MS 1000
+#define RECONNECT_MAX_MS 30000
 #define RESET_HOLD_MS 3000
 #define RESET_BUTTON_GPIO CONFIG_NUT_BUTTON_GPIO
 
@@ -60,6 +67,10 @@ static httpd_handle_t s_httpd;
 /* Scan results kept in module scope for the HTTP handler */
 static wifi_ap_record_t s_scan_results[SCAN_MAX];
 static uint16_t s_scan_count;
+
+/* Serialises portal scans with background connection attempts, which
+ * would otherwise abort each other */
+static SemaphoreHandle_t s_radio_lock;
 
 /* Credentials received from the portal */
 static char s_prov_ssid[33];
@@ -98,6 +109,25 @@ static void nvs_save_creds(const char *ssid, const char *pass)
 /* ------------------------------------------------------------------ */
 
 static int s_retry_count;
+static int s_max_retries;
+
+/* During provisioning a failed connection gives up after s_max_retries
+ * immediate retries so the portal can take over.  Once wifi_prov_start()
+ * has connected, a lost connection is retried forever, backing off from
+ * RECONNECT_MIN_MS up to RECONNECT_MAX_MS between attempts. */
+static bool s_auto_reconnect;
+static int s_reconnect_delay_ms = RECONNECT_MIN_MS;
+static esp_timer_handle_t s_reconnect_timer;
+
+static void reconnect_timer_cb(void *arg)
+{
+    esp_err_t err = esp_wifi_connect();
+    if (err != ESP_OK) {
+        /* No disconnect event follows a failed call, so retry from here */
+        ESP_LOGW(TAG, "Reconnect attempt failed: %s", esp_err_to_name(err));
+        esp_timer_start_once(s_reconnect_timer, RECONNECT_MAX_MS * 1000ULL);
+    }
+}
 
 static void wifi_event_handler(void *arg, esp_event_base_t base,
                                int32_t id, void *data)
@@ -105,7 +135,15 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
     if (base == WIFI_EVENT) {
         switch (id) {
         case WIFI_EVENT_STA_DISCONNECTED:
-            if (s_retry_count < 3) {
+            if (s_auto_reconnect) {
+                wifi_event_sta_disconnected_t *e = data;
+                ESP_LOGW(TAG, "WiFi disconnected (reason %d), retrying in %d s",
+                         e->reason, s_reconnect_delay_ms / 1000);
+                esp_timer_start_once(s_reconnect_timer, s_reconnect_delay_ms * 1000ULL);
+                s_reconnect_delay_ms *= 2;
+                if (s_reconnect_delay_ms > RECONNECT_MAX_MS)
+                    s_reconnect_delay_ms = RECONNECT_MAX_MS;
+            } else if (s_retry_count < s_max_retries) {
                 s_retry_count++;
                 esp_wifi_connect();
             } else {
@@ -119,8 +157,22 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
         ip_event_got_ip_t *e = data;
         ESP_LOGI(TAG, "Got IP: " IPSTR, IP2STR(&e->ip_info.ip));
         s_retry_count = 0;
+        s_reconnect_delay_ms = RECONNECT_MIN_MS;
+        esp_timer_stop(s_reconnect_timer);  /* drop any retry still scheduled */
         xEventGroupSetBits(s_wifi_events, BIT_CONNECTED);
     }
+}
+
+/* Called once wifi_prov_start() has a connection.  A disconnect handled
+ * before the flag was set took the provisioning path, which may already
+ * have given up, so if the link is down by now schedule a reconnect. */
+static void enable_auto_reconnect(void)
+{
+    wifi_ap_record_t ap;
+
+    s_auto_reconnect = true;
+    if (esp_wifi_sta_get_ap_info(&ap) != ESP_OK)
+        esp_timer_start_once(s_reconnect_timer, RECONNECT_MIN_MS * 1000ULL);
 }
 
 /* ------------------------------------------------------------------ */
@@ -245,9 +297,11 @@ static void do_scan(void)
         .scan_time.active.min = 120,
         .scan_time.active.max = 300,
     };
+    xSemaphoreTake(s_radio_lock, portMAX_DELAY);
     esp_wifi_scan_start(&scan_cfg, true);
     s_scan_count = SCAN_MAX;
     esp_wifi_scan_get_ap_records(&s_scan_count, s_scan_results);
+    xSemaphoreGive(s_radio_lock);
     ESP_LOGI(TAG, "Scan found %d networks", s_scan_count);
 }
 
@@ -376,12 +430,17 @@ static void start_http(void)
     httpd_register_uri_handler(s_httpd, &uri_catchall);
 }
 
-static void stop_ap_and_http(void)
+static void stop_http(void)
 {
     if (s_httpd) {
         httpd_stop(s_httpd);
         s_httpd = NULL;
     }
+}
+
+static void stop_ap_and_http(void)
+{
+    stop_http();
     esp_wifi_stop();
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_start());
@@ -391,7 +450,7 @@ static void stop_ap_and_http(void)
 /* STA connect attempt                                                 */
 /* ------------------------------------------------------------------ */
 
-static bool try_sta_connect(const char *ssid, const char *pass)
+static bool try_sta_connect(const char *ssid, const char *pass, int retries)
 {
     ESP_LOGI(TAG, "Connecting to \"%s\"...", ssid);
 
@@ -400,6 +459,7 @@ static bool try_sta_connect(const char *ssid, const char *pass)
     strncpy((char *)sta_cfg.sta.password, pass, sizeof(sta_cfg.sta.password) - 1);
 
     s_retry_count = 0;
+    s_max_retries = retries;
     xEventGroupClearBits(s_wifi_events, BIT_CONNECTED | BIT_FAIL);
 
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta_cfg));
@@ -417,6 +477,19 @@ static bool try_sta_connect(const char *ssid, const char *pass)
 
     ESP_LOGW(TAG, "Failed to connect to \"%s\"", ssid);
     return false;
+}
+
+/* One attempt to rejoin the stored network while the portal is up.  Each
+ * attempt briefly takes the radio off the portal's channel to scan, so it
+ * doesn't retry immediately; the caller tries again later. */
+static bool retry_stored_creds(const char *ssid, const char *pass)
+{
+    xSemaphoreTake(s_radio_lock, portMAX_DELAY);
+    bool ok = try_sta_connect(ssid, pass, 0);
+    if (!ok)
+        esp_wifi_disconnect();  /* abort the attempt if it timed out */
+    xSemaphoreGive(s_radio_lock);
+    return ok;
 }
 
 /* ------------------------------------------------------------------ */
@@ -501,6 +574,13 @@ static void start_button_monitor(void)
 void wifi_prov_start(void)
 {
     s_wifi_events = xEventGroupCreate();
+    s_radio_lock = xSemaphoreCreateMutex();
+
+    const esp_timer_create_args_t reconnect_args = {
+        .callback = reconnect_timer_cb,
+        .name = "wifi_reconnect",
+    };
+    ESP_ERROR_CHECK(esp_timer_create(&reconnect_args, &s_reconnect_timer));
 
     /* Check if user is holding the button to reset WiFi */
     bool force_portal = check_reset_button();
@@ -521,14 +601,16 @@ void wifi_prov_start(void)
     /* Try stored credentials first (unless reset was requested) */
     char ssid[33] = {0}, pass[65] = {0};
     bool have_creds = !force_portal &&
-                      nvs_load_creds(ssid, sizeof(ssid), pass, sizeof(pass));
+                      nvs_load_creds(ssid, sizeof(ssid), pass, sizeof(pass)) &&
+                      ssid[0] != '\0';
 
-    if (have_creds && ssid[0] != '\0') {
+    if (have_creds) {
         ESP_LOGI(TAG, "Found stored credentials for \"%s\"", ssid);
         ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
         ESP_ERROR_CHECK(esp_wifi_start());
 
-        if (try_sta_connect(ssid, pass)) {
+        if (try_sta_connect(ssid, pass, STA_CONNECT_RETRIES)) {
+            enable_auto_reconnect();
             start_button_monitor();
             return; /* success */
         }
@@ -544,10 +626,33 @@ void wifi_prov_start(void)
     led_status_set_disconnected();
 
     ESP_LOGI(TAG, "Connect to WiFi \"%s\" and open http://192.168.4.1", AP_SSID);
+    if (have_creds)
+        ESP_LOGI(TAG, "Retrying \"%s\" every %d s while the portal is up",
+                 ssid, RECONNECT_MAX_MS / 1000);
 
-    /* Wait for user to submit credentials */
+    /* Wait for user to submit credentials, meanwhile retrying the stored
+     * ones in case their network was only briefly down (e.g. the router
+     * was still booting after a power cut) */
+    TickType_t last_try = xTaskGetTickCount();
     while (!s_prov_received) {
         vTaskDelay(pdMS_TO_TICKS(500));
+        if (!have_creds ||
+            xTaskGetTickCount() - last_try < pdMS_TO_TICKS(RECONNECT_MAX_MS))
+            continue;
+
+        bool back = retry_stored_creds(ssid, pass);
+        last_try = xTaskGetTickCount();
+        if (back) {
+            stop_http();  /* no new submissions once this returns */
+            if (!s_prov_received) {
+                ESP_LOGI(TAG, "Reconnected to \"%s\", closing portal", ssid);
+                /* Drop the setup AP; the station stays connected */
+                ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+                enable_auto_reconnect();
+                start_button_monitor();
+                return;
+            }
+        }
     }
 
     /* Give the browser a moment to receive the response */
@@ -557,8 +662,9 @@ void wifi_prov_start(void)
     stop_ap_and_http();
 
     /* Try connecting with the new credentials */
-    if (try_sta_connect(s_prov_ssid, s_prov_pass)) {
+    if (try_sta_connect(s_prov_ssid, s_prov_pass, STA_CONNECT_RETRIES)) {
         nvs_save_creds(s_prov_ssid, s_prov_pass);
+        enable_auto_reconnect();
         start_button_monitor();
         return;
     }
